@@ -1080,7 +1080,7 @@ BOOL BQGetHermesEnabled(BOOL *enabled, NSString **err) {
 }
 
 // main-screen-class CacheData layouts derived from each build’s MobileGestalt table.
-static BOOL bq_ultraCache(NSDictionary *plist, NSMutableData **dataOut, NSUInteger *valueOffset, NSUInteger *presentOffset, NSString **err) {
+static BOOL bq_screenClassCache(NSDictionary *plist, NSMutableData **dataOut, NSUInteger *valueOffset, NSUInteger *presentOffset, NSString **err) {
     char build[128] = {0};
     size_t buildLength = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &buildLength, NULL, 0) != 0) {
@@ -1098,7 +1098,7 @@ static BOOL bq_ultraCache(NSDictionary *plist, NSMutableData **dataOut, NSUInteg
     if (uuid && length == 0) { length = 0x1950; value = 0xeb0; present = 0x1856; }
     NSData *data = plist[@"CacheData"];
     if (!uuid || ![plist[@"CacheUUID"] isEqual:uuid] || ![data isKindOfClass:[NSData class]] || data.length != length || ![plist[@"CacheExtra"] isKindOfClass:[NSDictionary class]]) {
-        if (err) *err = @"Ultra Faces cache layout is not supported on this watchOS build.";
+        if (err) *err = @"Series 12 Faces cache layout is not supported on this watchOS build.";
         return NO;
     }
     if (dataOut) *dataOut = [data mutableCopy];
@@ -1107,18 +1107,18 @@ static BOOL bq_ultraCache(NSDictionary *plist, NSMutableData **dataOut, NSUInteg
     return YES;
 }
 
-BOOL BQGetUltraFacesEnabled(BOOL *enabled, NSString **err) {
+BOOL BQGetSeries12FacesEnabled(BOOL *enabled, NSString **err) {
     NSDictionary *plist = BQLoadGestalt(err);
     NSMutableData *data = nil;
     NSUInteger valueOffset = 0, presentOffset = 0;
-    if (!plist || !bq_ultraCache(plist, &data, &valueOffset, &presentOffset, err)) return NO;
+    if (!plist || !bq_screenClassCache(plist, &data, &valueOffset, &presentOffset, err)) return NO;
     const uint8_t *bytes = data.bytes;
-    const uint8_t ultra[] = {29, 0, 0, 0};
-    if (enabled) *enabled = plist[@"CacheExtra"][@"fdh+s6j3VijuyrK7xLjd7g"] == nil && bytes[presentOffset] == 1 && memcmp(bytes + valueOffset, ultra, sizeof(ultra)) == 0;
+    const uint8_t series12[] = {35, 0, 0, 0};
+    if (enabled) *enabled = plist[@"CacheExtra"][@"fdh+s6j3VijuyrK7xLjd7g"] == nil && bytes[presentOffset] == 1 && memcmp(bytes + valueOffset, series12, sizeof(series12)) == 0;
     return YES;
 }
 
-BOOL BQSetUltraFacesEnabled(BOOL enabled, NSString **err) {
+BOOL BQSetSeries12FacesEnabled(BOOL enabled, NSString **err) {
     NSData *backupFile = [NSData dataWithContentsOfFile:BQBackupPath()];
     NSDictionary *backup = backupFile ? [NSPropertyListSerialization propertyListWithData:backupFile options:0 format:NULL error:NULL] : nil;
     if (![backup isKindOfClass:[NSDictionary class]]) {
@@ -1128,17 +1128,17 @@ BOOL BQSetUltraFacesEnabled(BOOL enabled, NSString **err) {
     NSMutableDictionary *plist = BQLoadGestalt(err);
     NSMutableData *data = nil, *original = nil;
     NSUInteger valueOffset = 0, presentOffset = 0;
-    if (!plist || !bq_ultraCache(plist, &data, &valueOffset, &presentOffset, err) || !bq_ultraCache(backup, &original, NULL, NULL, err)) return NO;
+    if (!plist || !bq_screenClassCache(plist, &data, &valueOffset, &presentOffset, err) || !bq_screenClassCache(backup, &original, NULL, NULL, err)) return NO;
     uint8_t *bytes = data.mutableBytes;
     const uint8_t *backupBytes = original.bytes;
     if (enabled && bytes[presentOffset] != 1) {
         if (err) *err = @"main-screen-class is not present in CacheData.";
         return NO;
     }
-    const uint8_t ultra[] = {29, 0, 0, 0};
-    if (enabled) memcpy(bytes + valueOffset, ultra, sizeof(ultra));
+    const uint8_t series12[] = {35, 0, 0, 0};
+    if (enabled) memcpy(bytes + valueOffset, series12, sizeof(series12));
     else {
-        memcpy(bytes + valueOffset, backupBytes + valueOffset, sizeof(ultra));
+        memcpy(bytes + valueOffset, backupBytes + valueOffset, sizeof(series12));
         bytes[presentOffset] = backupBytes[presentOffset];
     }
     NSString *key = @"fdh+s6j3VijuyrK7xLjd7g";
@@ -1151,12 +1151,12 @@ BOOL BQSetUltraFacesEnabled(BOOL enabled, NSString **err) {
     if (!BQSaveGestalt(plist, err)) return NO;
     NSDictionary *saved = BQLoadGestalt(err);
     NSMutableData *savedData = nil;
-    if (!saved || !bq_ultraCache(saved, &savedData, NULL, NULL, err)) return NO;
+    if (!saved || !bq_screenClassCache(saved, &savedData, NULL, NULL, err)) return NO;
     const uint8_t *savedBytes = savedData.bytes;
     id expectedOverride = enabled ? nil : originalOverride;
     id savedOverride = saved[@"CacheExtra"][key];
-    if (memcmp(savedBytes + valueOffset, bytes + valueOffset, sizeof(ultra)) != 0 || savedBytes[presentOffset] != bytes[presentOffset] || (expectedOverride ? ![savedOverride isEqual:expectedOverride] : savedOverride != nil)) {
-        if (err) *err = @"Ultra Faces cache changes could not be verified.";
+    if (memcmp(savedBytes + valueOffset, bytes + valueOffset, sizeof(series12)) != 0 || savedBytes[presentOffset] != bytes[presentOffset] || (expectedOverride ? ![savedOverride isEqual:expectedOverride] : savedOverride != nil)) {
+        if (err) *err = @"Series 12 Faces cache changes could not be verified.";
         return NO;
     }
     return YES;

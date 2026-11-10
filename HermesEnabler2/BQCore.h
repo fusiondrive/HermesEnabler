@@ -59,8 +59,8 @@ void BQRespring(void);
 BOOL BQEnableHermes(NSString **err);
 BOOL BQSetHermesEnabled(BOOL enabled, NSString **err);
 BOOL BQGetHermesEnabled(BOOL *enabled, NSString **err);
-BOOL BQSetUltraFacesEnabled(BOOL enabled, NSString **err);
-BOOL BQGetUltraFacesEnabled(BOOL *enabled, NSString **err);
+BOOL BQSetSeries12FacesEnabled(BOOL enabled, NSString **err);
+BOOL BQGetSeries12FacesEnabled(BOOL *enabled, NSString **err);
 
 // Reads whether the respective capability overrides are recorded as enabled.
 BOOL BQGetAODSupport(BOOL *enabled, NSString **err);
