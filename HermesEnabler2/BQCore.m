@@ -12,6 +12,7 @@
 #import <errno.h>
 #import <string.h>
 #import <stdlib.h>
+#import <math.h>
 #import <objc/message.h>
 #import <WatchKit/WatchKit.h>
 
@@ -790,7 +791,101 @@ NSString *BQBackupPath(void) {
 }
 
 BOOL BQBackupExists(void) {
-    return [[NSFileManager defaultManager] fileExistsAtPath:BQBackupPath()];
+    NSDictionary *plist = [NSDictionary dictionaryWithContentsOfFile:BQBackupPath()];
+    return [plist[@"CacheExtra"] isKindOfClass:[NSDictionary class]] &&
+           [plist[@"CacheData"] isKindOfClass:[NSData class]];
+}
+
+static NSString *bq_backups_directory(void) {
+    return [BQDocuments() stringByAppendingPathComponent:@"MGBackups"];
+}
+
+static BOOL bq_valid_gestalt_data(NSData *data) {
+    if (!data.length) return NO;
+    NSDictionary *plist = [NSPropertyListSerialization propertyListWithData:data options:0 format:NULL error:NULL];
+    return [plist isKindOfClass:[NSDictionary class]] &&
+           [plist[@"CacheExtra"] isKindOfClass:[NSDictionary class]] &&
+           [plist[@"CacheData"] isKindOfClass:[NSData class]];
+}
+
+static NSString *bq_create_gestalt_backup(NSString *kind, NSString **err) {
+    BOOL initial = [kind isEqualToString:@"initial"];
+    if (initial && [[NSFileManager defaultManager] fileExistsAtPath:BQBackupPath()]) {
+        if (err) *err = @"An initial backup already exists and will not be overwritten.";
+        return nil;
+    }
+    if (!initial && !BQBackupExists()) {
+        if (err) *err = @"Create the initial backup first.";
+        return nil;
+    }
+    NSString *link = nil;
+    int64_t h = BQEscape(kMGCaches, &link);
+    if (h < 0) {
+        if (err) *err = bq_escape_error(h);
+        return nil;
+    }
+    NSData *data = [NSData dataWithContentsOfFile:[link stringByAppendingPathComponent:@"com.apple.MobileGestalt.plist"]];
+    BQEndEscape(h);
+    if (!bq_valid_gestalt_data(data)) {
+        if (err) *err = @"MobileGestalt plist is missing or invalid.";
+        return nil;
+    }
+    NSString *identifier = initial ? @"initial" : [NSString stringWithFormat:@"%@-%@", kind, [NSUUID UUID].UUIDString];
+    NSString *path;
+    if (initial) {
+        path = BQBackupPath();
+    } else {
+        NSError *directoryError = nil;
+        [[NSFileManager defaultManager] createDirectoryAtPath:bq_backups_directory()
+                                  withIntermediateDirectories:YES attributes:nil error:&directoryError];
+        if (directoryError) {
+            if (err) *err = directoryError.localizedDescription;
+            return nil;
+        }
+        path = [bq_backups_directory() stringByAppendingPathComponent:[identifier stringByAppendingPathExtension:@"plist"]];
+    }
+    if (![data writeToFile:path atomically:YES] ||
+        ![[NSData dataWithContentsOfFile:path] isEqualToData:data]) {
+        if (err) *err = @"Backup could not be verified.";
+        return nil;
+    }
+    BQLog(@"MG %@ backup created: %@ (%lu bytes)", kind, identifier, (unsigned long)data.length);
+    return identifier;
+}
+
+NSString *BQCreateGestaltBackup(BOOL initial, NSString **err) {
+    return bq_create_gestalt_backup(initial ? @"initial" : @"manual", err);
+}
+
+static BOOL bq_auto_backup(NSString **err) {
+    return bq_create_gestalt_backup(@"auto", err) != nil;
+}
+
+NSArray<NSDictionary *> *BQListGestaltBackups(void) {
+    NSMutableArray<NSDictionary *> *result = [NSMutableArray array];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (BQBackupExists()) {
+        NSDictionary *attributes = [fm attributesOfItemAtPath:BQBackupPath() error:nil];
+        [result addObject:@{ @"id": @"initial", @"date": attributes[NSFileCreationDate] ?: [NSDate distantPast], @"initial": @YES }];
+    }
+    for (NSString *name in [fm contentsOfDirectoryAtPath:bq_backups_directory() error:nil]) {
+        NSString *identifier = name.stringByDeletingPathExtension;
+        BOOL automatic = [identifier hasPrefix:@"auto-"];
+        BOOL manual = [identifier hasPrefix:@"manual-"];
+        NSString *uuid = (automatic ? [identifier substringFromIndex:5] :
+                          manual ? [identifier substringFromIndex:7] : identifier);
+        if (![name.pathExtension isEqualToString:@"plist"] || ![[NSUUID alloc] initWithUUIDString:uuid]) continue;
+        NSString *path = [bq_backups_directory() stringByAppendingPathComponent:name];
+        if (!bq_valid_gestalt_data([NSData dataWithContentsOfFile:path])) continue;
+        NSDictionary *attributes = [fm attributesOfItemAtPath:path error:nil];
+        [result addObject:@{ @"id": identifier, @"date": attributes[NSFileCreationDate] ?: [NSDate distantPast],
+                             @"initial": @NO, @"kind": automatic ? @"Automatic" : @"Manual" }];
+    }
+    [result sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        if ([a[@"initial"] boolValue] != [b[@"initial"] boolValue]) return [a[@"initial"] boolValue] ? NSOrderedAscending : NSOrderedDescending;
+        return [b[@"date"] compare:a[@"date"]];
+    }];
+    return result;
 }
 
 NSString *BQMobileGestaltPath(void) {
@@ -842,14 +937,14 @@ static BOOL bq_write_data(NSString *path, NSData *data, NSString **err) {
     }
     NSString *tmp = [path stringByAppendingString:@".bqtmp"];
     if (![data writeToFile:tmp atomically:NO]) {
-        if (err) *err = @"temp write failed";
+        if (err) *err = NSLocalizedString(@"temp write failed", nil);
         return NO;
     }
     int fd = open(tmp.fileSystemRepresentation, O_RDONLY);
     if (fd >= 0) { fsync(fd); close(fd); }
     int r = rename(tmp.fileSystemRepresentation, path.fileSystemRepresentation);
     if (r != 0) {
-        if (err) *err = [NSString stringWithFormat:@"rename failed: %s", strerror(errno)];
+        if (err) *err = [NSString stringWithFormat:NSLocalizedString(@"rename failed: %@", nil), [NSString stringWithUTF8String:strerror(errno)]];
         unlink(tmp.fileSystemRepresentation);
         return NO;
     }
@@ -864,25 +959,20 @@ NSMutableDictionary *BQLoadGestalt(NSString **err) {
         return nil;
     }
     NSString *plist = [link stringByAppendingPathComponent:@"com.apple.MobileGestalt.plist"];
-    NSData *data = [NSData dataWithContentsOfFile:plist];
     NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithContentsOfFile:plist];
-    if (data.length && !BQBackupExists()) {
-        [data writeToFile:BQBackupPath() atomically:YES];
-        BQLog(@"MG backup created (%lu bytes)", (unsigned long)data.length);
-    }
     BQEndEscape(h);
     if (!dict) {
-        if (err) *err = @"MobileGestalt plist missing or invalid";
+        if (err) *err = NSLocalizedString(@"MobileGestalt plist missing or invalid", nil);
         return nil;
     }
     BQLog(@"MG loaded: %lu CacheExtra key(s), %lu byte(s)",
-          (unsigned long)[dict[@"CacheExtra"] count], (unsigned long)data.length);
+          (unsigned long)[dict[@"CacheExtra"] count], (unsigned long)[dict[@"CacheData"] length]);
     return dict;
 }
 
 BOOL BQSaveGestalt(NSDictionary *dict, NSString **err) {
     if (![dict isKindOfClass:[NSDictionary class]]) {
-        if (err) *err = @"invalid dictionary";
+        if (err) *err = NSLocalizedString(@"invalid dictionary", nil);
         return NO;
     }
     NSError *e = nil;
@@ -890,9 +980,10 @@ BOOL BQSaveGestalt(NSDictionary *dict, NSString **err) {
                                                               format:NSPropertyListBinaryFormat_v1_0
                                                              options:0 error:&e];
     if (!data.length) {
-        if (err) *err = [NSString stringWithFormat:@"serialize failed: %@", e];
+        if (err) *err = [NSString stringWithFormat:NSLocalizedString(@"serialize failed: %@", nil), e];
         return NO;
     }
+    if (!bq_auto_backup(err)) return NO;
     NSString *link = nil;
     int64_t h = BQEscape(kMGCaches, &link);
     if (h < 0) {
@@ -905,7 +996,7 @@ BOOL BQSaveGestalt(NSDictionary *dict, NSString **err) {
         NSMutableDictionary *check = [NSMutableDictionary dictionaryWithContentsOfFile:plist];
         if (!check) {
             ok = NO;
-            if (err) *err = @"post-write verification failed";
+            if (err) *err = NSLocalizedString(@"post-write verification failed", nil);
         } else {
             BQLog(@"MG saved: %lu bytes, %lu CacheExtra keys",
                   (unsigned long)data.length, (unsigned long)[check[@"CacheExtra"] count]);
@@ -916,11 +1007,28 @@ BOOL BQSaveGestalt(NSDictionary *dict, NSString **err) {
 }
 
 BOOL BQRestoreGestalt(NSString **err) {
-    NSData *backup = [NSData dataWithContentsOfFile:BQBackupPath()];
-    if (!backup.length) {
-        if (err) *err = @"backup not found";
+    return BQRestoreGestaltBackup(@"initial", err);
+}
+
+BOOL BQRestoreGestaltBackup(NSString *identifier, NSString **err) {
+    NSString *path = nil;
+    if ([identifier isEqualToString:@"initial"]) path = BQBackupPath();
+    else if ([identifier hasPrefix:@"auto-"] || [identifier hasPrefix:@"manual-"] ||
+             [[NSUUID alloc] initWithUUIDString:identifier]) {
+        NSString *uuid = [identifier hasPrefix:@"auto-"] ? [identifier substringFromIndex:5] :
+                         [identifier hasPrefix:@"manual-"] ? [identifier substringFromIndex:7] : identifier;
+        if (![[NSUUID alloc] initWithUUIDString:uuid]) {
+            if (err) *err = @"Invalid backup identifier.";
+            return NO;
+        }
+        path = [bq_backups_directory() stringByAppendingPathComponent:[identifier stringByAppendingPathExtension:@"plist"]];
+    }
+    NSData *backup = path ? [NSData dataWithContentsOfFile:path] : nil;
+    if (!bq_valid_gestalt_data(backup)) {
+        if (err) *err = @"Selected backup is missing or invalid.";
         return NO;
     }
+    NSDictionary *backupPlist = [NSPropertyListSerialization propertyListWithData:backup options:0 format:NULL error:NULL];
     NSString *link = nil;
     int64_t h = BQEscape(kMGCaches, &link);
     if (h < 0) {
@@ -928,14 +1036,68 @@ BOOL BQRestoreGestalt(NSString **err) {
         return NO;
     }
     NSString *plist = [link stringByAppendingPathComponent:@"com.apple.MobileGestalt.plist"];
+    NSDictionary *current = [NSDictionary dictionaryWithContentsOfFile:plist];
+    if (![current[@"CacheUUID"] isEqual:backupPlist[@"CacheUUID"]] ||
+        [current[@"CacheData"] length] != [backupPlist[@"CacheData"] length]) {
+        BQEndEscape(h);
+        if (err) *err = @"Backup cache layout does not match this watch.";
+        return NO;
+    }
+    BQEndEscape(h);
+    if (!bq_auto_backup(err)) return NO;
+    h = BQEscape(kMGCaches, &link);
+    if (h < 0) {
+        if (err) *err = bq_escape_error(h);
+        return NO;
+    }
+    plist = [link stringByAppendingPathComponent:@"com.apple.MobileGestalt.plist"];
+    current = [NSDictionary dictionaryWithContentsOfFile:plist];
+    if (![current[@"CacheUUID"] isEqual:backupPlist[@"CacheUUID"]] ||
+        [current[@"CacheData"] length] != [backupPlist[@"CacheData"] length]) {
+        BQEndEscape(h);
+        if (err) *err = @"MobileGestalt layout changed before restore; no data was written.";
+        return NO;
+    }
     BOOL ok = bq_write_data(plist, backup, err);
     if (ok) {
-        NSMutableDictionary *check = [NSMutableDictionary dictionaryWithContentsOfFile:plist];
-        ok = (check != nil);
-        BQLog(@"MG restored: %lu bytes ok=%d", (unsigned long)backup.length, ok);
+        NSData *check = [NSData dataWithContentsOfFile:plist];
+        ok = [check isEqualToData:backup];
+        if (!ok && err) *err = @"Restored file did not match the selected backup.";
+        BQLog(@"MG restored from %@: %lu bytes ok=%d", identifier, (unsigned long)backup.length, ok);
     }
     BQEndEscape(h);
     return ok;
+}
+
+BOOL BQDeleteGestaltBackup(NSString *identifier, NSString **err) {
+    if ([identifier isEqualToString:@"initial"]) {
+        if (err) *err = @"The initial backup is protected and cannot be deleted.";
+        return NO;
+    }
+    BOOL automatic = [identifier hasPrefix:@"auto-"];
+    BOOL manual = [identifier hasPrefix:@"manual-"];
+    if (!automatic && !manual) {
+        if (err) *err = @"Invalid backup identifier.";
+        return NO;
+    }
+    NSString *uuid = [identifier substringFromIndex:(automatic ? 5 : 7)];
+    if (![[NSUUID alloc] initWithUUIDString:uuid]) {
+        if (err) *err = @"Invalid backup identifier.";
+        return NO;
+    }
+    NSString *path = [bq_backups_directory() stringByAppendingPathComponent:[identifier stringByAppendingPathExtension:@"plist"]];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:path]) {
+        if (err) *err = @"Selected backup no longer exists.";
+        return NO;
+    }
+    NSError *removeError = nil;
+    if (![fm removeItemAtPath:path error:&removeError]) {
+        if (err) *err = removeError.localizedDescription ?: @"Backup could not be deleted.";
+        return NO;
+    }
+    BQLog(@"MG backup deleted: %@", identifier);
+    return YES;
 }
 
 typedef struct {
@@ -948,6 +1110,7 @@ typedef struct {
 
 static const BQDeviceBrandLayout kDeviceBrandLayouts[] = {
     {"24S5284h", "DB380F61-0014-418D-9799-876666B459E3", 0x1950, 0x348, 0x16e9},
+    {"24R359", "6F8372B0-1583-4031-A4BC-A54A18B0DD5A", 0x1947, 0x348, 0x16e1},
     {"24R364", "6F8372B0-1583-4031-A4BC-A54A18B0DD5A", 0x1947, 0x348, 0x16e1},
     {"24R365", "6F8372B0-1583-4031-A4BC-A54A18B0DD5A", 0x1947, 0x348, 0x16e1},
     {"24S118", "32B4CA84-FBDA-496C-9B79-2101D597158B", 0x1950, 0x348, 0x16e9},
@@ -956,13 +1119,13 @@ static const BQDeviceBrandLayout kDeviceBrandLayouts[] = {
 
 BOOL BQSetHermesEnabled(BOOL enabled, NSString **err) {
     if (!BQBackupExists()) {
-        if (err) *err = @"Back up MobileGestalt first.";
+        if (err) *err = NSLocalizedString(@"Back up MobileGestalt first.", nil);
         return NO;
     }
     NSData *backup = [NSData dataWithContentsOfFile:BQBackupPath()];
     id backupPlist = backup ? [NSPropertyListSerialization propertyListWithData:backup options:0 format:NULL error:NULL] : nil;
     if (![backupPlist isKindOfClass:[NSDictionary class]]) {
-        if (err) *err = @"The MobileGestalt backup is invalid.";
+        if (err) *err = NSLocalizedString(@"The MobileGestalt backup is invalid.", nil);
         return NO;
     }
     NSMutableDictionary *plist = BQLoadGestalt(err);
@@ -970,7 +1133,7 @@ BOOL BQSetHermesEnabled(BOOL enabled, NSString **err) {
     char build[128] = {0};
     size_t buildLength = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &buildLength, NULL, 0) != 0) {
-        if (err) *err = @"Could not identify the watchOS build.";
+        if (err) *err = NSLocalizedString(@"Could not identify the watchOS build.", nil);
         return NO;
     }
     const BQDeviceBrandLayout *layout = NULL;
@@ -981,7 +1144,7 @@ BOOL BQSetHermesEnabled(BOOL enabled, NSString **err) {
         }
     }
     if (!layout) {
-        if (err) *err = [NSString stringWithFormat:@"DeviceBrand CacheData layout is not verified for build %s.", build];
+        if (err) *err = [NSString stringWithFormat:NSLocalizedString(@"DeviceBrand CacheData layout is not verified for build %@.", nil), [NSString stringWithUTF8String:build]];
         return NO;
     }
     id extra = plist[@"CacheExtra"];
@@ -995,7 +1158,7 @@ BOOL BQSetHermesEnabled(BOOL enabled, NSString **err) {
         [cacheData length] != layout->dataLength || [backupCacheData length] != layout->dataLength ||
         layout->valueOffset > layout->dataLength - sizeof(uint32_t) ||
         layout->presentOffset >= layout->dataLength) {
-        if (err) *err = @"Unexpected MobileGestalt cache layout; no changes written.";
+        if (err) *err = NSLocalizedString(@"Unexpected MobileGestalt cache layout; no changes written.", nil);
         return NO;
     }
     const NSUInteger valueOffset = layout->valueOffset;
@@ -1004,7 +1167,7 @@ BOOL BQSetHermesEnabled(BOOL enabled, NSString **err) {
     uint8_t *bytes = modifiedData.mutableBytes;
     const uint8_t *backupBytes = (const uint8_t *)[backupCacheData bytes];
     if (enabled && bytes[presentOffset] != 1) {
-        if (err) *err = @"DeviceBrand is not present in CacheData; no changes written.";
+        if (err) *err = NSLocalizedString(@"DeviceBrand is not present in CacheData; no changes written.", nil);
         return NO;
     }
     // DeviceBrand is a little-endian signed 32-bit integer, in an 8-byte slot.
@@ -1023,11 +1186,12 @@ BOOL BQSetHermesEnabled(BOOL enabled, NSString **err) {
     plist[@"CacheExtra"] = changed;
     if (!BQSaveGestalt(plist, err)) return NO;
     NSMutableDictionary *check = BQLoadGestalt(err);
+    if (!check) return NO;
     NSData *saved = check[@"CacheData"];
     NSDictionary *savedExtra = check[@"CacheExtra"];
     if (![saved isKindOfClass:[NSData class]] || saved.length != layout->dataLength ||
         ![savedExtra isKindOfClass:[NSDictionary class]]) {
-        if (err) *err = @"The cache was written, but DeviceBrand could not be verified.";
+        if (err) *err = NSLocalizedString(@"The cache was written, but DeviceBrand could not be verified.", nil);
         return NO;
     }
     const uint8_t *savedBytes = (const uint8_t *)saved.bytes;
@@ -1035,10 +1199,11 @@ BOOL BQSetHermesEnabled(BOOL enabled, NSString **err) {
         ? (memcmp(savedBytes + valueOffset, one, sizeof(one)) == 0 && savedBytes[presentOffset] == 1)
         : (memcmp(savedBytes + valueOffset, backupBytes + valueOffset, sizeof(uint32_t)) == 0 &&
            savedBytes[presentOffset] == backupBytes[presentOffset]);
-    BOOL extraMatches = originalBrandOverride ? [savedExtra[brandKey] isEqual:originalBrandOverride]
-                                              : savedExtra[brandKey] == nil;
+    id expectedBrandOverride = enabled ? nil : originalBrandOverride;
+    BOOL extraMatches = expectedBrandOverride ? [savedExtra[brandKey] isEqual:expectedBrandOverride]
+                                               : savedExtra[brandKey] == nil;
     if (!dataMatches || !extraMatches) {
-        if (err) *err = @"The cache was written, but DeviceBrand could not be verified.";
+        if (err) *err = NSLocalizedString(@"The cache was written, but DeviceBrand could not be verified.", nil);
         return NO;
     }
     return YES;
@@ -1054,7 +1219,7 @@ BOOL BQGetHermesEnabled(BOOL *enabled, NSString **err) {
     char build[128] = {0};
     size_t buildLength = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &buildLength, NULL, 0) != 0) {
-        if (err) *err = @"Could not identify the watchOS build.";
+        if (err) *err = NSLocalizedString(@"Could not identify the watchOS build.", nil);
         return NO;
     }
     const BQDeviceBrandLayout *layout = NULL;
@@ -1068,7 +1233,7 @@ BOOL BQGetHermesEnabled(BOOL *enabled, NSString **err) {
     if (!layout || ![cacheData isKindOfClass:[NSData class]] ||
         ![plist[@"CacheUUID"] isEqual:[NSString stringWithUTF8String:layout->cacheUUID]] ||
         cacheData.length != layout->dataLength || layout->valueOffset > layout->dataLength - sizeof(uint32_t)) {
-        if (err) *err = @"DeviceBrand CacheData layout is unavailable or unverified.";
+        if (err) *err = NSLocalizedString(@"DeviceBrand CacheData layout is unavailable or unverified.", nil);
         return NO;
     }
     const uint8_t *bytes = (const uint8_t *)cacheData.bytes;
@@ -1080,25 +1245,25 @@ BOOL BQGetHermesEnabled(BOOL *enabled, NSString **err) {
 }
 
 // main-screen-class CacheData layouts derived from each build’s MobileGestalt table.
-static BOOL bq_screenClassCache(NSDictionary *plist, NSMutableData **dataOut, NSUInteger *valueOffset, NSUInteger *presentOffset, NSString **err) {
+static BOOL bq_ultraCache(NSDictionary *plist, NSMutableData **dataOut, NSUInteger *valueOffset, NSUInteger *presentOffset, NSString **err) {
     char build[128] = {0};
     size_t buildLength = sizeof(build);
     if (sysctlbyname("kern.osversion", build, &buildLength, NULL, 0) != 0) {
-        if (err) *err = @"Could not identify the watchOS build.";
+        if (err) *err = NSLocalizedString(@"Could not identify the watchOS build.", nil);
         return NO;
     }
     NSString *uuid = nil;
     NSUInteger length = 0, value = 0, present = 0;
     if (strcmp(build, "24S5284h") == 0) uuid = @"DB380F61-0014-418D-9799-876666B459E3";
     else if (strcmp(build, "24S132") == 0 || strcmp(build, "24S118") == 0) uuid = @"32B4CA84-FBDA-496C-9B79-2101D597158B";
-    else if (strcmp(build, "24R364") == 0 || strcmp(build, "24R365") == 0) {
+    else if (strcmp(build, "24R359") == 0 || strcmp(build, "24R364") == 0 || strcmp(build, "24R365") == 0) {
         uuid = @"6F8372B0-1583-4031-A4BC-A54A18B0DD5A";
         length = 0x1947; value = 0xea8; present = 0x184d;
     }
     if (uuid && length == 0) { length = 0x1950; value = 0xeb0; present = 0x1856; }
     NSData *data = plist[@"CacheData"];
     if (!uuid || ![plist[@"CacheUUID"] isEqual:uuid] || ![data isKindOfClass:[NSData class]] || data.length != length || ![plist[@"CacheExtra"] isKindOfClass:[NSDictionary class]]) {
-        if (err) *err = @"Series 12 Faces cache layout is not supported on this watchOS build.";
+        if (err) *err = NSLocalizedString(@"Series 12 Faces cache layout is not supported on this watchOS build.", nil);
         return NO;
     }
     if (dataOut) *dataOut = [data mutableCopy];
@@ -1111,7 +1276,7 @@ BOOL BQGetSeries12FacesEnabled(BOOL *enabled, NSString **err) {
     NSDictionary *plist = BQLoadGestalt(err);
     NSMutableData *data = nil;
     NSUInteger valueOffset = 0, presentOffset = 0;
-    if (!plist || !bq_screenClassCache(plist, &data, &valueOffset, &presentOffset, err)) return NO;
+    if (!plist || !bq_ultraCache(plist, &data, &valueOffset, &presentOffset, err)) return NO;
     const uint8_t *bytes = data.bytes;
     const uint8_t series12[] = {35, 0, 0, 0};
     if (enabled) *enabled = plist[@"CacheExtra"][@"fdh+s6j3VijuyrK7xLjd7g"] == nil && bytes[presentOffset] == 1 && memcmp(bytes + valueOffset, series12, sizeof(series12)) == 0;
@@ -1122,17 +1287,17 @@ BOOL BQSetSeries12FacesEnabled(BOOL enabled, NSString **err) {
     NSData *backupFile = [NSData dataWithContentsOfFile:BQBackupPath()];
     NSDictionary *backup = backupFile ? [NSPropertyListSerialization propertyListWithData:backupFile options:0 format:NULL error:NULL] : nil;
     if (![backup isKindOfClass:[NSDictionary class]]) {
-        if (err) *err = @"Back up MobileGestalt first.";
+        if (err) *err = NSLocalizedString(@"Back up MobileGestalt first.", nil);
         return NO;
     }
     NSMutableDictionary *plist = BQLoadGestalt(err);
     NSMutableData *data = nil, *original = nil;
     NSUInteger valueOffset = 0, presentOffset = 0;
-    if (!plist || !bq_screenClassCache(plist, &data, &valueOffset, &presentOffset, err) || !bq_screenClassCache(backup, &original, NULL, NULL, err)) return NO;
+    if (!plist || !bq_ultraCache(plist, &data, &valueOffset, &presentOffset, err) || !bq_ultraCache(backup, &original, NULL, NULL, err)) return NO;
     uint8_t *bytes = data.mutableBytes;
     const uint8_t *backupBytes = original.bytes;
     if (enabled && bytes[presentOffset] != 1) {
-        if (err) *err = @"main-screen-class is not present in CacheData.";
+        if (err) *err = NSLocalizedString(@"main-screen-class is not present in CacheData.", nil);
         return NO;
     }
     const uint8_t series12[] = {35, 0, 0, 0};
@@ -1151,12 +1316,12 @@ BOOL BQSetSeries12FacesEnabled(BOOL enabled, NSString **err) {
     if (!BQSaveGestalt(plist, err)) return NO;
     NSDictionary *saved = BQLoadGestalt(err);
     NSMutableData *savedData = nil;
-    if (!saved || !bq_screenClassCache(saved, &savedData, NULL, NULL, err)) return NO;
+    if (!saved || !bq_ultraCache(saved, &savedData, NULL, NULL, err)) return NO;
     const uint8_t *savedBytes = savedData.bytes;
     id expectedOverride = enabled ? nil : originalOverride;
     id savedOverride = saved[@"CacheExtra"][key];
     if (memcmp(savedBytes + valueOffset, bytes + valueOffset, sizeof(series12)) != 0 || savedBytes[presentOffset] != bytes[presentOffset] || (expectedOverride ? ![savedOverride isEqual:expectedOverride] : savedOverride != nil)) {
-        if (err) *err = @"Series 12 Faces cache changes could not be verified.";
+        if (err) *err = NSLocalizedString(@"Series 12 Faces cache changes could not be verified.", nil);
         return NO;
     }
     return YES;
@@ -1164,7 +1329,7 @@ BOOL BQSetSeries12FacesEnabled(BOOL enabled, NSString **err) {
 
 static BOOL bq_setMGCacheExtraKeys(NSArray<NSString *> *keys, BOOL enabled, NSString **err) {
     if (!BQBackupExists()) {
-        if (err) *err = @"Back up MobileGestalt first.";
+        if (err) *err = NSLocalizedString(@"Back up MobileGestalt first.", nil);
         return NO;
     }
 
@@ -1172,7 +1337,7 @@ static BOOL bq_setMGCacheExtraKeys(NSArray<NSString *> *keys, BOOL enabled, NSSt
     if (!plist) return NO;
     id cacheExtra = plist[@"CacheExtra"];
     if (![cacheExtra isKindOfClass:[NSDictionary class]]) {
-        if (err) *err = @"MobileGestalt CacheExtra is missing or invalid.";
+        if (err) *err = NSLocalizedString(@"MobileGestalt CacheExtra is missing or invalid.", nil);
         return NO;
     }
 
@@ -1187,7 +1352,7 @@ static BOOL bq_setMGCacheExtraKeys(NSArray<NSString *> *keys, BOOL enabled, NSSt
     for (NSString *key in keys) {
         id value = savedExtra[key];
         if (![value respondsToSelector:@selector(boolValue)] || [value boolValue] != enabled) {
-            if (err) *err = [NSString stringWithFormat:@"MobileGestalt override %@ did not save the requested state.", key];
+            if (err) *err = [NSString stringWithFormat:NSLocalizedString(@"MobileGestalt override %@ did not save the requested state.", nil), key];
             return NO;
         }
     }
@@ -1204,7 +1369,7 @@ static BOOL bq_getMGCacheExtraKeys(NSArray<NSString *> *keys, BOOL *enabled, NSS
     if (!plist) return NO;
     id cacheExtra = plist[@"CacheExtra"];
     if (![cacheExtra isKindOfClass:[NSDictionary class]]) {
-        if (err) *err = @"MobileGestalt CacheExtra is missing or invalid.";
+        if (err) *err = NSLocalizedString(@"MobileGestalt CacheExtra is missing or invalid.", nil);
         return NO;
     }
     BOOL allEnabled = YES;
@@ -1217,6 +1382,186 @@ static BOOL bq_getMGCacheExtraKeys(NSArray<NSString *> *keys, BOOL *enabled, NSS
         }
     }
     if (enabled) *enabled = allEnabled;
+    return YES;
+}
+
+static BOOL bq_setMGCacheExtraStrings(NSDictionary<NSString *, NSString *> *changes, NSString **err) {
+    if (!BQBackupExists()) {
+        if (err) *err = NSLocalizedString(@"Back up MobileGestalt first.", nil);
+        return NO;
+    }
+    NSMutableDictionary *plist = BQLoadGestalt(err);
+    if (!plist) return NO;
+    id cacheExtra = plist[@"CacheExtra"];
+    if (![cacheExtra isKindOfClass:[NSDictionary class]]) {
+        if (err) *err = NSLocalizedString(@"MobileGestalt CacheExtra is missing or invalid.", nil);
+        return NO;
+    }
+    NSMutableDictionary *updated = [cacheExtra mutableCopy];
+    [updated addEntriesFromDictionary:changes];
+    plist[@"CacheExtra"] = updated;
+    if (!BQSaveGestalt(plist, err)) return NO;
+
+    NSMutableDictionary *check = BQLoadGestalt(err);
+    NSDictionary *savedExtra = check[@"CacheExtra"];
+    for (NSString *key in changes) {
+        if (![savedExtra[key] isEqual:changes[key]]) {
+            if (err) *err = [NSString stringWithFormat:@"MobileGestalt override %@ did not save the requested value.", key];
+            return NO;
+        }
+    }
+    BQLog(@"MG CacheExtra strings updated: %@", changes);
+    return YES;
+}
+
+static NSString * const kMGRegionCodeKey = @"h63QSdBCiT/z0WU6rdQv6Q";
+static NSString * const kMGSalesRegionKey = @"zHeENZu+wbg7PUprwNwBWg";
+static NSString * const kMGLegacySalesRegionKey = @"yK+xavymRGZ3xWc1tb8XDg";
+
+NSString *BQGetRegionCode(NSString **err) {
+    NSMutableDictionary *plist = BQLoadGestalt(err);
+    if (!plist) return nil;
+    id value = plist[@"CacheExtra"][kMGRegionCodeKey];
+    if (value && ![value isKindOfClass:[NSString class]]) {
+        if (err) *err = @"RegionCode has an unsupported value type.";
+        return nil;
+    }
+    return value;
+}
+
+NSString *BQGetSalesRegion(NSString **err) {
+    NSMutableDictionary *plist = BQLoadGestalt(err);
+    if (!plist) return nil;
+    NSDictionary *extra = plist[@"CacheExtra"];
+    id current = extra[kMGSalesRegionKey];
+    id legacy = extra[kMGLegacySalesRegionKey];
+    if ((current && ![current isKindOfClass:[NSString class]]) ||
+        (legacy && ![legacy isKindOfClass:[NSString class]])) {
+        if (err) *err = @"Sales region has an unsupported value type.";
+        return nil;
+    }
+    if (current && legacy && ![current isEqual:legacy]) {
+        if (err) *err = @"Sales region fields disagree; choose a value to align them.";
+        return nil;
+    }
+    return current ?: legacy;
+}
+
+BOOL BQSetRegionCode(NSString *code, NSString **err) {
+    if (![code isKindOfClass:[NSString class]] || code.length == 0) {
+        if (err) *err = @"RegionCode must not be empty.";
+        return NO;
+    }
+    return bq_setMGCacheExtraStrings(@{ kMGRegionCodeKey: code }, err);
+}
+
+BOOL BQSetSalesRegion(NSString *suffix, NSString **err) {
+    if (![suffix isKindOfClass:[NSString class]] || suffix.length == 0) {
+        if (err) *err = @"Sales region suffix must not be empty.";
+        return NO;
+    }
+    if (!BQBackupExists()) {
+        if (err) *err = NSLocalizedString(@"Back up MobileGestalt first.", nil);
+        return NO;
+    }
+    NSMutableDictionary *plist = BQLoadGestalt(err);
+    if (!plist) return NO;
+    id cacheExtra = plist[@"CacheExtra"];
+    if (![cacheExtra isKindOfClass:[NSDictionary class]]) {
+        if (err) *err = NSLocalizedString(@"MobileGestalt CacheExtra is missing or invalid.", nil);
+        return NO;
+    }
+    NSMutableDictionary *changes = [NSMutableDictionary dictionary];
+    if (cacheExtra[kMGSalesRegionKey]) changes[kMGSalesRegionKey] = suffix;
+    if (cacheExtra[kMGLegacySalesRegionKey]) changes[kMGLegacySalesRegionKey] = suffix;
+    // Newer layouts normally use the current key. Do not add both variants.
+    if (changes.count == 0) changes[kMGSalesRegionKey] = suffix;
+    return bq_setMGCacheExtraStrings(changes, err);
+}
+
+static NSString * const kMGScreenWidthKey = @"g7YQ1Djxh4YiKlEeaoGhzg";
+static NSString * const kMGScreenHeightKey = @"OjzOua0LkOegX7pQdgMksw";
+
+BOOL BQGetScreenResolution(NSInteger *width, NSInteger *height, BOOL *overridden, NSString **err) {
+    NSMutableDictionary *plist = BQLoadGestalt(err);
+    if (!plist) return NO;
+    NSDictionary *extra = plist[@"CacheExtra"];
+    if (![extra isKindOfClass:[NSDictionary class]]) {
+        if (err) *err = NSLocalizedString(@"MobileGestalt CacheExtra is missing or invalid.", nil);
+        return NO;
+    }
+    id storedWidth = extra[kMGScreenWidthKey];
+    id storedHeight = extra[kMGScreenHeightKey];
+    if ((storedWidth && ![storedWidth isKindOfClass:[NSNumber class]]) ||
+        (storedHeight && ![storedHeight isKindOfClass:[NSNumber class]])) {
+        if (err) *err = @"Screen dimensions have an unsupported value type.";
+        return NO;
+    }
+    CGSize native = [WKInterfaceDevice currentDevice].screenBounds.size;
+    CGFloat scale = [WKInterfaceDevice currentDevice].screenScale;
+    NSInteger currentWidth = storedWidth ? [storedWidth integerValue] : (NSInteger)llround(native.width * scale);
+    NSInteger currentHeight = storedHeight ? [storedHeight integerValue] : (NSInteger)llround(native.height * scale);
+    if (currentWidth <= 0 || currentHeight <= 0) {
+        if (err) *err = @"Screen dimensions are invalid.";
+        return NO;
+    }
+    if (width) *width = currentWidth;
+    if (height) *height = currentHeight;
+    NSDictionary *original = [NSDictionary dictionaryWithContentsOfFile:BQBackupPath()][@"CacheExtra"];
+    id originalWidth = original[kMGScreenWidthKey];
+    id originalHeight = original[kMGScreenHeightKey];
+    if (overridden) *overridden = !((storedWidth == originalWidth || [storedWidth isEqual:originalWidth]) &&
+                                   (storedHeight == originalHeight || [storedHeight isEqual:originalHeight]));
+    return YES;
+}
+
+BOOL BQSetScreenResolution(NSInteger width, NSInteger height, NSString **err) {
+    BOOL restore = width == 0 && height == 0;
+    if (!restore && !((width == 324 && height == 394) ||
+                      (width == 368 && height == 448) ||
+                      (width == 352 && height == 430) ||
+                      (width == 396 && height == 484) ||
+                      (width == 374 && height == 446) ||
+                      (width == 416 && height == 496))) {
+        if (err) *err = @"Unsupported screen resolution preset.";
+        return NO;
+    }
+    if (!BQBackupExists()) {
+        if (err) *err = NSLocalizedString(@"Back up MobileGestalt first.", nil);
+        return NO;
+    }
+    NSMutableDictionary *plist = BQLoadGestalt(err);
+    NSDictionary *extra = plist[@"CacheExtra"];
+    NSDictionary *backup = [NSDictionary dictionaryWithContentsOfFile:BQBackupPath()];
+    NSDictionary *original = backup[@"CacheExtra"];
+    if (!plist || ![extra isKindOfClass:[NSDictionary class]] ||
+        ![original isKindOfClass:[NSDictionary class]]) {
+        if (err) *err = @"MobileGestalt or its backup is invalid.";
+        return NO;
+    }
+    NSMutableDictionary *updated = [extra mutableCopy];
+    if (restore) {
+        for (NSString *key in @[kMGScreenWidthKey, kMGScreenHeightKey]) {
+            id value = original[key];
+            if (value) updated[key] = value;
+            else [updated removeObjectForKey:key];
+        }
+    } else {
+        updated[kMGScreenWidthKey] = @(width);
+        updated[kMGScreenHeightKey] = @(height);
+    }
+    plist[@"CacheExtra"] = updated;
+    if (!BQSaveGestalt(plist, err)) return NO;
+    NSDictionary *saved = BQLoadGestalt(err)[@"CacheExtra"];
+    for (NSString *key in @[kMGScreenWidthKey, kMGScreenHeightKey]) {
+        id expected = updated[key];
+        id actual = saved[key];
+        if (expected ? ![expected isEqual:actual] : actual != nil) {
+            if (err) *err = @"Screen resolution write could not be verified.";
+            return NO;
+        }
+    }
+    BQLog(@"MG screen dimensions %@", restore ? @"restored from backup" : [NSString stringWithFormat:@"%ld x %ld", (long)width, (long)height]);
     return YES;
 }
 
@@ -1447,6 +1792,32 @@ BOOL BQSetSwimmingWorkouts(BOOL enabled, NSString **err) {
     ], enabled, err);
 }
 
+// These hashes are the MobileGestalt capability fields used by the
+// corresponding Intelligence presets. watchOS may ignore fields that its
+// build, hardware, language, or Apple services do not support.
+BOOL BQGetAppleIntelligence(BOOL *enabled, NSString **err) {
+    return bq_getMGCacheExtraKeys(@[@"A62OafQ85EJAiiqKn4agtg"], enabled, err);
+}
+
+BOOL BQGetOnDeviceSiri(BOOL *enabled, NSString **err) {
+    return bq_getMGCacheExtraKeys(@[@"K/R1GfGfCkXvEhaPS2Vrng"], enabled, err);
+}
+
+BOOL BQGetAudioIntelligence(BOOL *enabled, NSString **err) {
+    return bq_getMGCacheExtraKeys(@[@"rb2tKZxlj0Gm2tBmUQSLqQ"], enabled, err);
+}
+
+BOOL BQSetAppleIntelligence(BOOL enabled, NSString **err) {
+    return bq_setMGCacheExtraKeys(@[@"A62OafQ85EJAiiqKn4agtg"], enabled, err);
+}
+
+BOOL BQSetOnDeviceSiri(BOOL enabled, NSString **err) {
+    return bq_setMGCacheExtraKeys(@[@"K/R1GfGfCkXvEhaPS2Vrng"], enabled, err);
+}
+
+BOOL BQSetAudioIntelligence(BOOL enabled, NSString **err) {
+    return bq_setMGCacheExtraKeys(@[@"rb2tKZxlj0Gm2tBmUQSLqQ"], enabled, err);
+}
 
 // NeoSpring from Gester, with UIKit and WebKit accessed dynamically on watchOS.
 static id gRespringWebView;
